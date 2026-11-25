@@ -19,11 +19,12 @@ struct gu_hbm_worker {
 	struct gu_hbm hbm;
 	struct delayed_work work;
 	struct notifier_block pci_nb, pm_nb;
-	bool bound, paused, stopping, pci_registered, pm_registered;
+	bool bound, paused, disabled, stopping, pci_registered, pm_registered;
 	bool boot_seen;
 	const char *last_reason;
 	int last_error;
 	int last_access;
+	int hard_fails;
 	u64 last_report, last_status;
 };
 
@@ -35,7 +36,7 @@ static bool nvidia(struct pci_dev *pdev)
 static void queue(struct gu_hbm_worker *worker, unsigned long delay)
 {
 	if (READ_ONCE(worker->bound) && !READ_ONCE(worker->paused) &&
-	    !READ_ONCE(worker->stopping))
+	    !READ_ONCE(worker->disabled) && !READ_ONCE(worker->stopping))
 		mod_delayed_work(system_freezable_wq, &worker->work, delay);
 }
 
@@ -133,6 +134,17 @@ static void sample(struct gu_hbm_worker *worker)
 		}
 	}
 	if (ret) {
+		if (ret != worker->last_error || hbm->reason != worker->last_reason)
+			worker->hard_fails = 0;
+		if (ret != -EAGAIN)
+			worker->hard_fails++;
+		if (worker->hard_fails >= GU_HBM_HARD_FAIL_LIMIT &&
+		    !READ_ONCE(worker->disabled)) {
+			WRITE_ONCE(worker->disabled, true);
+			pci_warn(worker->pdev, "gpu_unlock: HBM governor disabled after %d consecutive %s failures (%d); leaving HBM clocks to the driver\n",
+				 worker->hard_fails,
+				 hbm->reason ? hbm->reason : "hardware unavailable", ret);
+		}
 		if (ret != worker->last_error || hbm->reason != worker->last_reason ||
 		    (ret != -EAGAIN && start - worker->last_report >= 5000000000ull)) {
 			if (ret == -EAGAIN)
@@ -146,9 +158,12 @@ static void sample(struct gu_hbm_worker *worker)
 					 hbm->coverage[0], hbm->coverage[1], hbm->coverage[2], hbm->idle, hbm->fb_stopped);
 			worker->last_report = start;
 		}
-	} else if (worker->last_error || !worker->last_report) {
-		pci_dbg(worker->pdev, "gpu_unlock: HBM activity sampling active counters=%#x\n", hbm->counters);
-		worker->last_report = start;
+	} else {
+		worker->hard_fails = 0;
+		if (worker->last_error || !worker->last_report) {
+			pci_dbg(worker->pdev, "gpu_unlock: HBM activity sampling active counters=%#x\n", hbm->counters);
+			worker->last_report = start;
+		}
 	}
 	worker->last_error = ret;
 	worker->last_reason = hbm->reason;
@@ -164,10 +179,11 @@ static void sample(struct gu_hbm_worker *worker)
 static void poll(struct work_struct *work)
 {
 	struct gu_hbm_worker *worker = container_of(work, struct gu_hbm_worker, work.work);
+	unsigned int delay = GU_HBM_POLL_MS;
 	int pm;
 
-	if (READ_ONCE(worker->paused) || READ_ONCE(worker->stopping) ||
-	    !READ_ONCE(worker->bound))
+	if (READ_ONCE(worker->paused) || READ_ONCE(worker->disabled) ||
+	    READ_ONCE(worker->stopping) || !READ_ONCE(worker->bound))
 		return;
 	if (device_trylock(&worker->pdev->dev)) {
 		pm = begin(worker);
@@ -175,6 +191,8 @@ static void poll(struct work_struct *work)
 			if (worker->last_access)
 				pci_dbg(worker->pdev, "gpu_unlock: HBM PCI access resumed\n");
 			sample(worker);
+			if (worker->last_error && worker->last_error != -EAGAIN)
+				delay = GU_HBM_RETRY_MS;
 			end(worker, pm);
 		} else {
 			if (pm != worker->last_access)
@@ -185,7 +203,7 @@ static void poll(struct work_struct *work)
 		worker->last_access = pm < 0 ? pm : 0;
 		device_unlock(&worker->pdev->dev);
 	}
-	queue(worker, msecs_to_jiffies(GU_HBM_POLL_MS));
+	queue(worker, msecs_to_jiffies(delay));
 }
 
 static void restore_locked(struct gu_hbm_worker *worker)
