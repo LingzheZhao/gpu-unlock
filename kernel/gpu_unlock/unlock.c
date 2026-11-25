@@ -1657,7 +1657,7 @@ static int unlock_transaction_handover(struct unlock_transaction_work *work)
 		return GU_RESULT(ret);
 	}
 	if (family->link_speed &&
-	    gu_pcie_relink(work->pdev, work->bar, work->bar_len, family))
+	    gu_pcie_relink(work->pdev, work->bar, work->bar_len, family, false))
 		dev_info(&work->pdev->dev, "gpu_unlock: link not retrained before the driver's pass; retried after it\n");
 	/* After resume BAR1 already has its window and nvidia is bound. */
 	if (!work->resume) {
@@ -1770,6 +1770,43 @@ static int unlock_transaction_flr(struct unlock_transaction_work *work)
 	return 0;
 }
 
+/* Scale CMP 170HX LOCAL_MEMORY_RANGE from live active FBPs so VFI-unlocked
+ * 10-FBP (80 GiB) or 12-FBP (96 GiB) 8 GB cards and 12-FBP (48 GiB) 10 GB
+ * cards work alongside stock 8-FBP (64 GiB) / 10-FBP (40 GiB) cards in the
+ * same host without hardcoding per-card floorsweep masks. */
+static void adjust_ga100_memory_range(struct unlock_transaction_work *work)
+{
+	u32 count = 0, disabled = 0, range;
+	unsigned int active = 0, gib = 0;
+	size_t i;
+
+	if (work->card->chip != 0x170 || !work->card->privileged.count ||
+	    !work->prepared_writes)
+		return;
+	if (read_bar(work, GU_MEMORY_FBP_COUNT_OFFSET, &count) ||
+	    read_bar(work, GU_MEMORY_FBP_DISABLED_OFFSET, &disabled))
+		return;
+	range = gu_memory_cmp170hx_range(work->pdev->device,
+					 work->pdev->subsystem_device,
+					 count, disabled, &active, &gib);
+	if (!range) {
+		if (active)
+			dev_info(&work->pdev->dev,
+				 "gpu_unlock: CMP 170HX active_fbps=%u/%u (fbp_disabled=%#x), keeping stock memory range\n",
+				 active, count & 0x1fu, disabled);
+		return;
+	}
+	for (i = 0; i < work->privileged.count; i++) {
+		if (work->prepared_writes[i].addr == GU_LOCAL_MEMORY_RANGE_OFFSET) {
+			work->prepared_writes[i].value = range;
+			dev_info(&work->pdev->dev,
+				 "gpu_unlock: CMP 170HX active_fbps=%u/%u (fbp_disabled=%#x) -> local_memory_range=%#x (%u GiB)\n",
+				 active, count & 0x1fu, disabled, range, gib);
+			return;
+		}
+	}
+}
+
 int gpu_unlock_run(const struct gu_device *device, const struct gpu_unlock_shared *shared,
 			  enum gu_unlock_mode mode)
 {
@@ -1849,8 +1886,10 @@ int gpu_unlock_run(const struct gu_device *device, const struct gpu_unlock_share
 	if (!ret) {
 		ret = gu_recipe_prepare(work->card, work->ecc_enabled,
 					&work->prepared_writes, &work->privileged.count);
-		if (!ret)
+		if (!ret) {
 			work->privileged.entries = work->prepared_writes;
+			adjust_ga100_memory_range(work);
+		}
 	}
 	if (!ret) {
 		size_t i;

@@ -271,6 +271,14 @@ int main(void)
 	pdev.bridge.preserve_config = true;
 	assert(!gu_pcie_bar1_resize(&pdev, NULL, 0, &family));
 	check_card(&pdev, 6);
+	/* Firmware BAR larger than REBAR max (e.g. 128 GiB vs 64 GiB mask). */
+	init_card(&pdev);
+	pdev.resource[1].end = pdev.resource[1].start + (1ULL << 37) - 1;
+	pdev.stuck_decoder = true;
+	assert(!gu_pcie_bar1_resize(&pdev, NULL, 0, &family));
+	assert(!locked && bars_assigned(&pdev));
+	assert(pci_resource_len(&pdev, 1) == (1ULL << 37));
+	assert(pdev.command == (PCI_COMMAND_MEMORY | PCI_COMMAND_INTX_DISABLE));
 	struct pci_dev cards[8];
 	pthread_t threads[ARRAY_SIZE(cards)];
 	unsigned int before = host_writes;

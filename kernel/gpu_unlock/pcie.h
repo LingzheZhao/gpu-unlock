@@ -11,12 +11,11 @@ struct pci_dev;
  * the trap if its effective readback does not match. */
 int gu_pcie_p2p_check(struct pci_dev *pdev, void __iomem *bar, resource_size_t len);
 
-/* Apply the family's relink table, then set the target link speed of the card
- * and its upstream bridge to family->link_speed and retrain the link from the
- * bridge. bar maps len bytes of BAR0 from offset 0. The caller holds
- * pci_dev_lock. Returns 0 once the link runs at that generation or faster. */
+/* Apply the family's relink table on unfused cards, or preserve native fused
+ * Gen3/Gen4 capability (training to Gen3/Gen4 once post_driver is true).
+ * bar maps len bytes of BAR0 from offset 0. The caller holds pci_dev_lock. */
 int gu_pcie_relink(struct pci_dev *pdev, void __iomem *bar, resource_size_t len,
-		   const struct gu_family *family);
+		   const struct gu_family *family, bool post_driver);
 
 /* Apply the family's bar1 table, then resize BAR1 to the largest size the
  * bridge window fits, as nvidia's nv_resize_pcie_bars does. On failure BAR1

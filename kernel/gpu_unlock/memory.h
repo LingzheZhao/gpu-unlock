@@ -19,6 +19,13 @@ struct gu_memory_info {
 
 int gu_memory_decode_range(u32 range, struct gu_memory_info *info);
 
+/* Compute an adjusted CMP 170HX LOCAL_MEMORY_RANGE from live FBP count/disable
+ * registers when active FBPs exceed stock counts (e.g. 10-FBP 80 GiB or 12-FBP
+ * 96 GiB on a VFI-unlocked 0x20c2:0x1585 card). Returns 0 to keep stock. */
+u32 gu_memory_cmp170hx_range(u16 device, u16 subsystem_device,
+			     u32 fbp_count, u32 fbp_disabled,
+			     unsigned int *active_fbps, unsigned int *gib);
+
 /* Firmware must be quiesced. Does not alter the temporary Booter layout.
  * Verify final capacity and reconcile firmware bookkeeping before PLM locks. */
 int gu_memory_finalize(struct device *dev, void __iomem *bar, resource_size_t len,

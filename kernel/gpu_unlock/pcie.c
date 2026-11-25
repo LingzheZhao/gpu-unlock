@@ -7,6 +7,7 @@
  * nv_resize_pcie_bars.
  */
 #include <linux/delay.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/timekeeping.h>
@@ -21,6 +22,16 @@
 #define GU_RETRAIN_TIMEOUT_US   2000000
 #define GU_RETRAIN_FALLBACK_MS  500
 #define GU_RELINK_SETTLE_MS  200  /* the strap shadow latches after the writes */
+
+static int ga100_pcie_gen;
+module_param(ga100_pcie_gen, int, 0444);
+MODULE_PARM_DESC(ga100_pcie_gen,
+	"GA100 PCIe link target on fused Gen3/Gen4 cards: 0=auto (Gen4 via E1 if fused & supported, else Gen3), 3=Gen3 only, 4=Gen4 via E1, -1=disable relink (default: 0)");
+
+static bool pcie_reg_readable(u32 value)
+{
+	return value != ~0u && (value & 0xffff0000u) != 0xbadf0000u;
+}
 
 int gu_pcie_p2p_check(struct pci_dev *pdev, void __iomem *bar, resource_size_t len)
 {
@@ -221,16 +232,183 @@ static int retrain(struct pci_dev *pdev, unsigned int gen,
 	return ret;
 }
 
+/* Replay the seven A100 Gen4 PHY DevInit registers that the CMP VBIOS omits,
+ * from a trained Gen3 link with the driver bound. Every register is read and
+ * validated first and written as one aligned 32-bit MMIO store, with
+ * LINK_CONFIG_0 written last. */
+static int ga100_apply_gen4_e1(struct pci_dev *pdev, void __iomem *bar,
+			       resource_size_t len)
+{
+	u32 phy1, phy0, cya0, pl_rate, misc1, vsec, link_cfg0;
+
+	if ((u64)GU_XP_CYA_0_OFFSET + 4 > len)
+		return -ERANGE;
+	phy1 = readl(bar + GU_XVE_GEN4_PHY_CFG1_OFFSET);
+	phy0 = readl(bar + GU_XVE_GEN4_PHY_CFG0_OFFSET);
+	cya0 = readl(bar + GU_XP_CYA_0_OFFSET);
+	pl_rate = readl(bar + GU_XP_PL_LINK_RATE_OFFSET);
+	misc1 = readl(bar + GU_XVE_PRIV_MISC_1_OFFSET);
+	vsec = readl(bar + GU_XVE_VSEC_HIERARCHY_OFFSET);
+	link_cfg0 = readl(bar + GU_XP_LINK_CONFIG_0_OFFSET);
+	if (!pcie_reg_readable(phy1) || !pcie_reg_readable(phy0) ||
+	    !pcie_reg_readable(cya0) || !pcie_reg_readable(pl_rate) ||
+	    !pcie_reg_readable(misc1) || !pcie_reg_readable(vsec) ||
+	    !pcie_reg_readable(link_cfg0)) {
+		pci_warn(pdev, "gpu_unlock: Gen4 E1 aborted: unreadable PHY register(s)\n");
+		return -EIO;
+	}
+	writel(0x00000014u, bar + GU_XVE_GEN4_PHY_CFG1_OFFSET);
+	writel((phy0 & ~0x3fu) | 0x6u, bar + GU_XVE_GEN4_PHY_CFG0_OFFSET);
+	writel(cya0 & ~(BIT(0) | BIT(2) | BIT(3) | BIT(13) | BIT(23)),
+	       bar + GU_XP_CYA_0_OFFSET);
+	writel((pl_rate & ~(0xfu << 16)) | (4u << 16),
+	       bar + GU_XP_PL_LINK_RATE_OFFSET);
+	writel((misc1 & ~(BIT(12) | BIT(14) | BIT(30) | BIT(31))) |
+	       BIT(11) | BIT(13), bar + GU_XVE_PRIV_MISC_1_OFFSET);
+	writel(vsec | BIT(0) | BIT(12), bar + GU_XVE_VSEC_HIERARCHY_OFFSET);
+	/* Write LINK_CONFIG_0 bits 19:18 = 0 (Gen4) last as one 32-bit store. */
+	writel(link_cfg0 & ~(3u << 18), bar + GU_XP_LINK_CONFIG_0_OFFSET);
+	msleep(GU_RELINK_SETTLE_MS);
+	log_policy(pdev, bar, len, 1);
+	return 0;
+}
+
+/* Single config-space retrain attempt for Gen4 after E1; rolls target link
+ * speed back to Gen3 (without retraining) if 16 GT/s does not complete. */
+static int retrain_gen4_once(struct pci_dev *pdev, struct pci_dev *bridge,
+			     bool active_reporting, void __iomem *bar,
+			     resource_size_t len)
+{
+	ktime_t start = ktime_get(), attempt;
+	u16 ep = 0xffff, up = 0xffff, ep_target = 0, up_target = 0;
+	int ret;
+
+	ret = pcie_capability_clear_and_set_word(pdev, PCI_EXP_LNKCTL2,
+						 PCI_EXP_LNKCTL2_TLS, 4);
+	if (!ret)
+		ret = pcie_capability_clear_and_set_word(bridge, PCI_EXP_LNKCTL2,
+							 PCI_EXP_LNKCTL2_TLS, 4);
+	if (ret)
+		return pcibios_err_to_errno(ret);
+	ret = pcie_capability_read_word(pdev, PCI_EXP_LNKCTL2, &ep_target);
+	if (!ret)
+		ret = pcie_capability_read_word(bridge, PCI_EXP_LNKCTL2, &up_target);
+	if (ret)
+		return pcibios_err_to_errno(ret);
+	if ((ep_target & PCI_EXP_LNKCTL2_TLS) != 4 ||
+	    (up_target & PCI_EXP_LNKCTL2_TLS) != 4) {
+		ret = -EOPNOTSUPP;
+		goto fallback_gen3;
+	}
+	ret = wait_link(pdev, bridge, 0, active_reporting, false, &ep, &up);
+	log_link(pdev, bridge, "gen4-request", 1, start, ep, up, ret);
+	if (ret)
+		goto fallback_gen3;
+	if ((ep & PCI_EXP_LNKSTA_CLS) >= 4 && (up & PCI_EXP_LNKSTA_CLS) >= 4)
+		return 0;
+	attempt = ktime_get();
+	ret = pcie_capability_set_word(bridge, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_RL);
+	if (ret) {
+		ret = pcibios_err_to_errno(ret);
+		goto fallback_gen3;
+	}
+	ret = wait_link(pdev, bridge, 4, active_reporting, false, &ep, &up);
+	log_link(pdev, bridge, "gen4-complete", 1, attempt, ep, up, ret);
+	log_policy(pdev, bar, len, 2);
+	if (!ret)
+		return 0;
+fallback_gen3:
+	pcie_capability_clear_and_set_word(pdev, PCI_EXP_LNKCTL2,
+					   PCI_EXP_LNKCTL2_TLS, 3);
+	pcie_capability_clear_and_set_word(bridge, PCI_EXP_LNKCTL2,
+					   PCI_EXP_LNKCTL2_TLS, 3);
+	return ret;
+}
+
+static int relink_fused(struct pci_dev *pdev, void __iomem *bar,
+			resource_size_t len, u32 cap2, bool post_driver)
+{
+	struct pci_dev *bridge;
+	u32 bridge_cap = 0, magic_d = ~0u;
+	unsigned int ep_max, bridge_max, target;
+	u16 ep = 0xffff, up = 0xffff;
+	bool active_reporting;
+	int ret;
+
+	if (!post_driver) {
+		pci_info(pdev, "gpu_unlock: preserving native fused PCIe capability cap2=%#x until post-devinit\n",
+			 cap2);
+		return 0;
+	}
+	bridge = pci_upstream_bridge(pdev);
+	if (!bridge || !pci_is_pcie(pdev) || !pci_is_pcie(bridge))
+		return -ENODEV;
+	ret = pcie_capability_read_dword(bridge, PCI_EXP_LNKCAP, &bridge_cap);
+	if (ret)
+		return pcibios_err_to_errno(ret);
+	active_reporting = bridge_cap & PCI_EXP_LNKCAP_DLLLARC;
+	bridge_max = bridge_cap & PCI_EXP_LNKCAP_SLS;
+	ep_max = (cap2 & BIT(4)) ? 4u : 3u;
+	if (ep_max >= 4 && (u64)GU_OPT_PCIE_MAGIC_OFFSET + 4 <= len) {
+		magic_d = readl(bar + GU_OPT_PCIE_MAGIC_OFFSET);
+		if (!pcie_reg_readable(magic_d) || (magic_d & BIT(25)))
+			ep_max = 3;
+	}
+	target = min(ep_max, bridge_max);
+	if (ga100_pcie_gen > 0 && (unsigned int)ga100_pcie_gen < target)
+		target = (unsigned int)ga100_pcie_gen;
+	if (target < 2)
+		return 0;
+	ret = link_status(pdev, bridge, &ep, &up);
+	if (!ret && (ep & PCI_EXP_LNKSTA_CLS) >= target &&
+	    (up & PCI_EXP_LNKSTA_CLS) >= target) {
+		pci_info(pdev, "gpu_unlock: fused PCIe link already at Gen%u (target Gen%u)\n",
+			 ep & PCI_EXP_LNKSTA_CLS, target);
+		return 0;
+	}
+	if (target <= 3)
+		return retrain(pdev, target, bar, len);
+	/* Train Gen3 cleanly before applying the CMP VBIOS Gen4 E1 PHY init. */
+	if (ret || (ep & PCI_EXP_LNKSTA_CLS) < 3 || (up & PCI_EXP_LNKSTA_CLS) < 3) {
+		ret = retrain(pdev, 3, bar, len);
+		if (ret)
+			return ret;
+	}
+	ret = ga100_apply_gen4_e1(pdev, bar, len);
+	if (ret) {
+		pci_warn(pdev, "gpu_unlock: Gen4 E1 PHY setup failed (%d); keeping Gen3\n", ret);
+		return 0;
+	}
+	ret = retrain_gen4_once(pdev, bridge, active_reporting, bar, len);
+	if (ret) {
+		pci_warn(pdev, "gpu_unlock: Gen4 retrain did not complete (%d); keeping Gen3\n", ret);
+		return 0;
+	}
+	pci_info(pdev, "gpu_unlock: fused PCIe link trained to Gen4 (16 GT/s)\n");
+	return 0;
+}
+
 int gu_pcie_relink(struct pci_dev *pdev, void __iomem *bar, resource_size_t len,
-		   const struct gu_family *family)
+		   const struct gu_family *family, bool post_driver)
 {
 	u32 cap2;
 	int ret;
 
 	if (!family->link_speed)
 		return 0;
+	if (ga100_pcie_gen < 0) {
+		if (post_driver)
+			pci_info(pdev, "gpu_unlock: PCIe relink disabled (ga100_pcie_gen=%d)\n",
+				 ga100_pcie_gen);
+		return 0;
+	}
 	if ((u64)GU_XVE_LINK_CTRL_2_OFFSET + 4 > len)
 		return -ERANGE;
+	cap2 = readl(bar + GU_XVE_LINK_CAP_2_OFFSET);
+	/* Never run the Gen2 downgrade sequence on a card whose fuses already
+	 * advertise Gen3 or Gen4. */
+	if (pcie_reg_readable(cap2) && (cap2 & (BIT(3) | BIT(4))))
+		return relink_fused(pdev, bar, len, cap2, post_driver);
 	ret = gu_host_writes(&pdev->dev, bar, len, &family->relink, "link");
 	if (ret)
 		return ret;
@@ -306,11 +484,15 @@ static int bar1_control(struct pci_dev *pdev)
 
 /* The unlock changes the decoder before Linux can allocate its new window.
  * Restore the old size so failed PCI resize attempts roll back to that size. */
-static int set_bar1_size(struct pci_dev *pdev, int control, int size)
+static int set_bar1_size(struct pci_dev *pdev, int control, int size, u64 sizes)
 {
 	u32 ctrl, observed;
 	int ret;
 
+	/* Firmware can leave BAR1 larger than REBAR advertises (e.g. 128 GiB
+	 * while the REBAR mask stops at 64 GiB). Leave the decoder as-is. */
+	if (!(sizes & BIT_ULL(size)))
+		return 0;
 	ret = pci_read_config_dword(pdev, control, &ctrl);
 	if (ret)
 		return pcibios_err_to_errno(ret);
@@ -324,13 +506,13 @@ static int set_bar1_size(struct pci_dev *pdev, int control, int size)
 	       (ctrl & PCI_REBAR_CTRL_BAR_SIZE) ? 0 : -EIO;
 }
 
-static int restore_bars(struct pci_dev *pdev, int control, int size,
+static int restore_bars(struct pci_dev *pdev, int control, int size, u64 sizes,
 			const struct resource *saved)
 {
 	unsigned int i;
 	int ret;
 
-	ret = set_bar1_size(pdev, control, size);
+	ret = set_bar1_size(pdev, control, size, sizes);
 	if (ret)
 		return ret;
 	for (i = 0; i < ARRAY_SIZE(resize_bars); i++) {
@@ -420,7 +602,7 @@ int gu_pcie_bar1_resize(struct pci_dev *pdev, void __iomem *bar, resource_size_t
 		ret = pcibios_err_to_errno(ret);
 		goto out;
 	}
-	ret = restore_bars(pdev, control, old, saved);
+	ret = restore_bars(pdev, control, old, sizes, saved);
 	if (ret)
 		goto out;
 	for (size = fls64(sizes) - 1; size > old; size--) {
@@ -438,7 +620,7 @@ int gu_pcie_bar1_resize(struct pci_dev *pdev, void __iomem *bar, resource_size_t
 		}
 		/* Reclaim the working windows before another attempt. If none of
 		 * the larger sizes fit, these are also the successful fallback. */
-		error = restore_bars(pdev, control, old, saved);
+		error = restore_bars(pdev, control, old, sizes, saved);
 		if (error) {
 			ret = error;
 			goto out;

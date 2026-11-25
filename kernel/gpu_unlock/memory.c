@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <linux/bitops.h>
 #include <linux/device.h>
 #include <linux/delay.h>
 #include <linux/io.h>
@@ -21,6 +22,49 @@ int gu_memory_decode_range(u32 range, struct gu_memory_info *info)
 	info->physical_bytes = physical;
 	info->usable_bytes = range & (1u << 30) ? physical / 16 * 15 : physical;
 	return 0;
+}
+
+u32 gu_memory_cmp170hx_range(u16 device, u16 subsystem_device,
+			     u32 fbp_count, u32 fbp_disabled,
+			     unsigned int *active_fbps, unsigned int *gib)
+{
+	u32 fbps, mask, range = 0;
+	unsigned int active, size_gib = 0;
+	struct gu_memory_info info = { };
+
+	if (active_fbps)
+		*active_fbps = 0;
+	if (gib)
+		*gib = 0;
+	if (fbp_count == ~0u || (fbp_count & 0xffff0000u) == 0xbadf0000u ||
+	    fbp_disabled == ~0u || (fbp_disabled & 0xffff0000u) == 0xbadf0000u)
+		return 0;
+	fbps = fbp_count & 0x1fu;
+	if (!fbps || fbps > 16)
+		return 0;
+	mask = (1u << fbps) - 1u;
+	active = hweight32((~fbp_disabled) & mask);
+	if (active_fbps)
+		*active_fbps = active;
+	if (device == 0x20c2 && subsystem_device == 0x1585) {
+		if (active > 8 && active <= 12) {
+			range = ((active * 4u) << 4) | 0xbu;
+			size_gib = active * 8u;
+		}
+	} else if (device == 0x2082) {
+		if (active > 10 && active <= 12) {
+			range = ((active * 4u) << 4) | 0xau;
+			size_gib = active * 4u;
+		}
+	}
+	if (!range)
+		return 0;
+	if (gu_memory_decode_range(range, &info) ||
+	    info.physical_bytes != ((u64)size_gib << 30))
+		return 0;
+	if (gib)
+		*gib = size_gib;
+	return range;
 }
 
 static int memory_read(void __iomem *bar, resource_size_t len, u32 offset, u32 *value)

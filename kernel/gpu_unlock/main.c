@@ -264,7 +264,7 @@ static int relink_one(struct card *card)
 		    (wpr_hi & 0xffff0000u) == 0xbadf0000u)
 			ret = -EAGAIN;
 		else
-			ret = gu_pcie_relink(pdev, bar, pci_resource_len(pdev, 0), family);
+			ret = gu_pcie_relink(pdev, bar, pci_resource_len(pdev, 0), family, true);
 		if (!ret && card->device.recipe->chip == 0x170) {
 			gu_inforom_log_ga100(&pdev->dev, bar, pci_resource_len(pdev, 0), "relink");
 			gu_ecc_log(&pdev->dev, bar, pci_resource_len(pdev, 0), "relink");
