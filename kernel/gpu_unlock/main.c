@@ -24,6 +24,7 @@
 #include "recipes.h"
 #include "vram.h"
 #include "hbm.h"
+#include "name.h"
 #include "overrides.h"
 
 static char *targets;
@@ -45,6 +46,10 @@ MODULE_PARM_DESC(vram_temps, "Report the VRAM temperatures of supported cards th
 static bool hbm_governor = true;
 module_param(hbm_governor, bool, 0444);
 MODULE_PARM_DESC(hbm_governor, "Lower the HBM clock of unlocked cards while they are idle (default: on; set 0 to leave HBM clocks to the driver)");
+
+static bool cmp170hx_name = true;
+module_param(cmp170hx_name, bool, 0444);
+MODULE_PARM_DESC(cmp170hx_name, "Report unlocked CMP 170HX cards as \"NVIDIA CMP 170HX\" instead of \"NVIDIA Graphics Device\" (default: on)");
 
 /* A target card. Those unlocked at boot stay listed, with a reference, to be
  * unlocked again after each resume. */
@@ -482,6 +487,18 @@ static int unlock_targets(void)
 		}
 	}
 	if (!list_empty(&cards)) {
+		bool has_cmp170hx = false;
+
+		list_for_each_entry(card, &cards, node) {
+			u16 dev = card->device.pdev->device;
+
+			if (dev == 0x20c2 || dev == 0x2082) {
+				has_cmp170hx = true;
+				break;
+			}
+		}
+		if (cmp170hx_name && has_cmp170hx)
+			gu_name_init();
 		ret = register_pm_notifier(&pm_nb);
 		if (ret)
 			return ret;
@@ -497,6 +514,7 @@ static void gpu_unlock_cleanup(void)
 	struct card *card, *next;
 
 	WRITE_ONCE(pm_suspending, true);
+	gu_name_exit();
 	gu_vram_remove();
 	gu_overrides_remove();
 	if (relink_published)

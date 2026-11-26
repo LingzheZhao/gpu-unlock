@@ -2,7 +2,7 @@
 obj-m += gpu_unlock.o
 gpu_unlock-y := main.o gfw_eval.o prep.o layout.o \
 	vbios.o recipes.o payload.o firmware.o falcon.o unlock.o fuses.o \
-	host.o pcie.o vram.o inforom.o ecc.o memory.o vpr.o pm.o hbm.o hbm_work.o overrides.o
+	host.o pcie.o vram.o inforom.o ecc.o memory.o vpr.o pm.o hbm.o hbm_work.o name.o overrides.o
 # Stable kernels also backport the extra pci_resize_resource argument.
 ccflags-y += $(if $(shell grep -s 'int exclude_bars' $(srctree)/include/linux/pci.h),-DGU_RESIZE_EXCLUDE_BARS)
 # Probe APIs that distribution kernels backport independently of their version.

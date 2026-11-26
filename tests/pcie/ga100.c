@@ -79,8 +79,13 @@ static void log_policy(struct pci_dev *pdev, void __iomem *bar,
 	policy_logs++;
 }
 
+#define GU_NV_NAME_MAX		64U
+#define GU_CMP170HX_NAME	"NVIDIA CMP 170HX"
+#define GU_CMP170HX_SHORT_NAME	"CMP 170HX"
+
 #include "ga100-mem.c"
 #include "ga100-e1.c"
+#include "ga100-name.c"
 
 static void init_e1_regs(void)
 {
@@ -200,6 +205,34 @@ int main(void)
 	assert(ga100_apply_gen4_e1(&pdev, NULL, GU_XP_CYA_0_OFFSET) == -ERANGE);
 	assert(write_count == 0);
 
-	puts("GA100 VFI extensions: dynamic 64/80/96/48 GiB FBP sizing and atomic Gen4 E1 PHY writes passed");
+	/* CMP 170HX branding rewrites: only replace generic fallback strings. */
+	{
+		char buf[GU_NV_NAME_MAX];
+
+		memset(buf, 0x5a, sizeof(buf));
+		strcpy(buf, "NVIDIA Graphics Device");
+		assert(gu_name_rewrite_full(buf, sizeof(buf)));
+		assert(!strcmp(buf, "NVIDIA CMP 170HX"));
+		assert(buf[sizeof(buf) - 1] == '\0');
+
+		strcpy(buf, "NVIDIA GeForce RTX 4090");
+		assert(!gu_name_rewrite_full(buf, sizeof(buf)));
+		assert(!strcmp(buf, "NVIDIA GeForce RTX 4090"));
+
+		strcpy(buf, "Graphics Device");
+		assert(gu_name_rewrite_short(buf, sizeof(buf)));
+		assert(!strcmp(buf, "CMP 170HX"));
+
+		strcpy(buf, "NVIDIA A100 80GB PCIe");
+		assert(!gu_name_rewrite_short(buf, sizeof(buf)));
+		assert(!strcmp(buf, "NVIDIA A100 80GB PCIe"));
+
+		assert(!strcmp(gu_name_device_override(0x20c2, "Unknown"), "NVIDIA CMP 170HX"));
+		assert(!strcmp(gu_name_device_override(0x2082, NULL), "NVIDIA CMP 170HX"));
+		assert(gu_name_device_override(0x20c2, "NVIDIA CMP 170HX") == NULL);
+		assert(gu_name_device_override(0x2204, "Unknown") == NULL);
+	}
+
+	puts("GA100 VFI extensions: dynamic 64/80/96/48 GiB FBP sizing, Gen3/Gen4 E1 PHY, and CMP 170HX branding passed");
 	return 0;
 }
