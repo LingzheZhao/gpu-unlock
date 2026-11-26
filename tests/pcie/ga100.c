@@ -40,6 +40,7 @@ static u32 write_log[16];
 static unsigned int write_count;
 static unsigned int sleep_calls;
 static unsigned int policy_logs;
+static unsigned int last_policy_pass;
 
 static u32 readl(const void *ptr)
 {
@@ -74,7 +75,7 @@ static void log_policy(struct pci_dev *pdev, void __iomem *bar,
 		       resource_size_t len, unsigned int pass)
 {
 	(void)pdev; (void)bar; (void)len;
-	assert(pass == 1);
+	last_policy_pass = pass;
 	policy_logs++;
 }
 
@@ -152,10 +153,32 @@ int main(void)
 	assert(gu_memory_cmp170hx_range(0x20c2, 0x1585, 0xbadf1100u, 0x840, &active, &gib) == 0);
 	assert(gu_memory_cmp170hx_range(0x20c2, 0x1585, 12, 0xffffffffu, &active, &gib) == 0);
 
+	/* Gen3 PHY clamp-clear (before Gen3 retrain): exact NUC post-DevInit values. */
+	init_e1_regs();
+	regs[2].val = 0x060731b7u; /* CYA_0 with Gen1/Gen2 disable bits set */
+	regs[4].val = 0x800c4c00u; /* LINK_CONFIG_0 [19:18] = 3 (Gen1) */
+	regs[5].val = 0x20b40500u; /* PRIV_MISC_1 CMP VBIOS default */
+	assert(!ga100_apply_gen3_phy(&pdev, NULL, 0x100000));
+	assert(write_count == 5 && sleep_calls == 1 && policy_logs == 1 && last_policy_pass == 0);
+	assert(write_log[4] == GU_XP_LINK_CONFIG_0_OFFSET);
+	assert(reg_val(GU_XP_CYA_0_OFFSET) == 0x060731b2u);
+	assert(reg_val(GU_XP_PL_LINK_RATE_OFFSET) == 0x00130036u);
+	assert(reg_val(GU_XP_LINK_CONFIG_0_OFFSET) == 0x80044c00u);
+	assert(reg_val(GU_XVE_PRIV_MISC_1_OFFSET) == 0x20b42d00u);
+	assert(reg_val(GU_XVE_VSEC_HIERARCHY_OFFSET) == 0x00001001u);
+
+	/* Gen3 abort guard: unreadable register aborts with zero writes. */
+	for (unsigned int i = 2; i < 7; i++) {
+		init_e1_regs();
+		regs[i].val = (i & 1) ? 0xbadf1020u : 0xffffffffu;
+		assert(ga100_apply_gen3_phy(&pdev, NULL, 0x100000) == -EIO);
+		assert(write_count == 0 && sleep_calls == 0);
+	}
+
 	/* E1 PHY writes: verify exact before->after bitmasks and LINK_CONFIG_0 written last. */
 	init_e1_regs();
 	assert(!ga100_apply_gen4_e1(&pdev, NULL, 0x100000));
-	assert(write_count == 7 && sleep_calls == 1 && policy_logs == 1);
+	assert(write_count == 7 && sleep_calls == 1 && policy_logs == 1 && last_policy_pass == 1);
 	assert(write_log[6] == GU_XP_LINK_CONFIG_0_OFFSET);
 	assert(reg_val(GU_XVE_GEN4_PHY_CFG1_OFFSET) == 0x00000014u);
 	assert(reg_val(GU_XVE_GEN4_PHY_CFG0_OFFSET) == 0x12345606u);

@@ -232,6 +232,42 @@ static int retrain(struct pci_dev *pdev, unsigned int gen,
 	return ret;
 }
 
+/* Clear the CMP VBIOS / IFF Gen1 training clamp so a fused Gen3/Gen4 card can
+ * train to Gen3 before E1 lifts the Gen4 PHY registers. Every register is read
+ * and validated first and written as one aligned 32-bit MMIO store, with
+ * LINK_CONFIG_0 written last. */
+static int ga100_apply_gen3_phy(struct pci_dev *pdev, void __iomem *bar,
+				resource_size_t len)
+{
+	u32 cya0, pl_rate, misc1, vsec, link_cfg0;
+
+	if ((u64)GU_XP_CYA_0_OFFSET + 4 > len)
+		return -ERANGE;
+	cya0 = readl(bar + GU_XP_CYA_0_OFFSET);
+	pl_rate = readl(bar + GU_XP_PL_LINK_RATE_OFFSET);
+	misc1 = readl(bar + GU_XVE_PRIV_MISC_1_OFFSET);
+	vsec = readl(bar + GU_XVE_VSEC_HIERARCHY_OFFSET);
+	link_cfg0 = readl(bar + GU_XP_LINK_CONFIG_0_OFFSET);
+	if (!pcie_reg_readable(cya0) || !pcie_reg_readable(pl_rate) ||
+	    !pcie_reg_readable(misc1) || !pcie_reg_readable(vsec) ||
+	    !pcie_reg_readable(link_cfg0)) {
+		pci_warn(pdev, "gpu_unlock: Gen3 PHY setup aborted: unreadable register(s)\n");
+		return -EIO;
+	}
+	writel(cya0 & ~(BIT(0) | BIT(2) | BIT(3)), bar + GU_XP_CYA_0_OFFSET);
+	writel((pl_rate & ~(0xfu << 16)) | (3u << 16),
+	       bar + GU_XP_PL_LINK_RATE_OFFSET);
+	writel((misc1 & ~(BIT(12) | BIT(14) | BIT(30) | BIT(31))) |
+	       BIT(11) | BIT(13), bar + GU_XVE_PRIV_MISC_1_OFFSET);
+	writel(vsec | BIT(0) | BIT(12), bar + GU_XVE_VSEC_HIERARCHY_OFFSET);
+	/* Write LINK_CONFIG_0 bits 19:18 = 1 (Gen3) last as one 32-bit store. */
+	writel((link_cfg0 & ~(3u << 18)) | (1u << 18),
+	       bar + GU_XP_LINK_CONFIG_0_OFFSET);
+	msleep(GU_RELINK_SETTLE_MS);
+	log_policy(pdev, bar, len, 0);
+	return 0;
+}
+
 /* Replay the seven A100 Gen4 PHY DevInit registers that the CMP VBIOS omits,
  * from a trained Gen3 link with the driver bound. Every register is read and
  * validated first and written as one aligned 32-bit MMIO store, with
@@ -330,7 +366,7 @@ static int relink_fused(struct pci_dev *pdev, void __iomem *bar,
 {
 	struct pci_dev *bridge;
 	u32 bridge_cap = 0, magic_d = ~0u;
-	unsigned int ep_max, bridge_max, target;
+	unsigned int ep_max, bridge_max, target, stage1;
 	u16 ep = 0xffff, up = 0xffff;
 	bool active_reporting;
 	int ret;
@@ -366,14 +402,20 @@ static int relink_fused(struct pci_dev *pdev, void __iomem *bar,
 			 ep & PCI_EXP_LNKSTA_CLS, target);
 		return 0;
 	}
-	if (target <= 3)
-		return retrain(pdev, target, bar, len);
-	/* Train Gen3 cleanly before applying the CMP VBIOS Gen4 E1 PHY init. */
-	if (ret || (ep & PCI_EXP_LNKSTA_CLS) < 3 || (up & PCI_EXP_LNKSTA_CLS) < 3) {
-		ret = retrain(pdev, 3, bar, len);
+	/* Clear CMP VBIOS / IFF Gen1 clamps and train Gen3 (or Gen2 on a Gen2
+	 * slot) cleanly before applying the CMP VBIOS Gen4 E1 PHY init. */
+	stage1 = min(target, 3u);
+	if (ret || (ep & PCI_EXP_LNKSTA_CLS) < stage1 ||
+	    (up & PCI_EXP_LNKSTA_CLS) < stage1) {
+		ret = ga100_apply_gen3_phy(pdev, bar, len);
+		if (ret)
+			return ret;
+		ret = retrain(pdev, stage1, bar, len);
 		if (ret)
 			return ret;
 	}
+	if (target <= 3)
+		return 0;
 	ret = ga100_apply_gen4_e1(pdev, bar, len);
 	if (ret) {
 		pci_warn(pdev, "gpu_unlock: Gen4 E1 PHY setup failed (%d); keeping Gen3\n", ret);
