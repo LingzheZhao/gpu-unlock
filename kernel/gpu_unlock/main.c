@@ -51,6 +51,10 @@ static bool cmp170hx_name = true;
 module_param(cmp170hx_name, bool, 0444);
 MODULE_PARM_DESC(cmp170hx_name, "Report unlocked CMP 170HX cards as \"NVIDIA CMP 170HX\" instead of \"NVIDIA Graphics Device\" (default: on)");
 
+static bool pcie_gen_report = true;
+module_param(pcie_gen_report, bool, 0444);
+MODULE_PARM_DESC(pcie_gen_report, "Report real fused PCIe Gen4 link speed through NVML/nvidia-smi when GSP-RM caches Gen3 (default: on)");
+
 /* A target card. Those unlocked at boot stay listed, with a reference, to be
  * unlocked again after each resume. */
 struct card {
@@ -210,6 +214,7 @@ static int gpu_unlock_pm_notify(struct notifier_block *nb, unsigned long event, 
 	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
 		WRITE_ONCE(pm_suspending, true);
+		gu_name_reset_pcie_gen();
 		list_for_each_entry(card, &cards, node)
 			cancel_delayed_work_sync(&card->relink);
 		if (event != PM_SUSPEND_PREPARE || !READ_ONCE(resume))
@@ -493,12 +498,12 @@ static int unlock_targets(void)
 			u16 dev = card->device.pdev->device;
 
 			if (dev == 0x20c2 || dev == 0x2082) {
+				gu_name_register_card(card->device.pdev);
 				has_cmp170hx = true;
-				break;
 			}
 		}
-		if (cmp170hx_name && has_cmp170hx)
-			gu_name_init();
+		if (has_cmp170hx && (cmp170hx_name || pcie_gen_report))
+			gu_name_init(cmp170hx_name, pcie_gen_report);
 		ret = register_pm_notifier(&pm_nb);
 		if (ret)
 			return ret;

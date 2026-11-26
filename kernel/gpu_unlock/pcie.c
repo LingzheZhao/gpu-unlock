@@ -13,6 +13,7 @@
 #include <linux/timekeeping.h>
 
 #include "host.h"
+#include "name.h"
 #include "pcie.h"
 #include "recipes.h"
 #include "registers.h"
@@ -398,8 +399,11 @@ static int relink_fused(struct pci_dev *pdev, void __iomem *bar,
 	ret = link_status(pdev, bridge, &ep, &up);
 	if (!ret && (ep & PCI_EXP_LNKSTA_CLS) >= target &&
 	    (up & PCI_EXP_LNKSTA_CLS) >= target) {
+		u8 cur = min_t(u8, ep & PCI_EXP_LNKSTA_CLS, up & PCI_EXP_LNKSTA_CLS);
+
+		gu_name_set_pcie_gen(pdev, target, cur);
 		pci_info(pdev, "gpu_unlock: fused PCIe link already at Gen%u (target Gen%u)\n",
-			 ep & PCI_EXP_LNKSTA_CLS, target);
+			 cur, target);
 		return 0;
 	}
 	/* Clear CMP VBIOS / IFF Gen1 clamps and train Gen3 (or Gen2 on a Gen2
@@ -414,18 +418,23 @@ static int relink_fused(struct pci_dev *pdev, void __iomem *bar,
 		if (ret)
 			return ret;
 	}
-	if (target <= 3)
+	if (target <= 3) {
+		gu_name_set_pcie_gen(pdev, target, stage1);
 		return 0;
+	}
 	ret = ga100_apply_gen4_e1(pdev, bar, len);
 	if (ret) {
+		gu_name_set_pcie_gen(pdev, 3, 3);
 		pci_warn(pdev, "gpu_unlock: Gen4 E1 PHY setup failed (%d); keeping Gen3\n", ret);
 		return 0;
 	}
 	ret = retrain_gen4_once(pdev, bridge, active_reporting, bar, len);
 	if (ret) {
+		gu_name_set_pcie_gen(pdev, 3, 3);
 		pci_warn(pdev, "gpu_unlock: Gen4 retrain did not complete (%d); keeping Gen3\n", ret);
 		return 0;
 	}
+	gu_name_set_pcie_gen(pdev, 4, 4);
 	pci_info(pdev, "gpu_unlock: fused PCIe link trained to Gen4 (16 GT/s)\n");
 	return 0;
 }

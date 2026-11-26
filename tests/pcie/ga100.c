@@ -8,6 +8,7 @@
 
 #include "registers.h"
 
+typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
@@ -233,6 +234,31 @@ int main(void)
 		assert(gu_name_device_override(0x2204, "Unknown") == NULL);
 	}
 
-	puts("GA100 VFI extensions: dynamic 64/80/96/48 GiB FBP sizing, Gen3/Gen4 E1 PHY, and CMP 170HX branding passed");
+	/* NV2080_CTRL_BUS_INFO_INDEX_PCIE_GEN_INFO rewrite: 0-based Gen fields. */
+	{
+		/* CMP 170HX stale Gen3 cache (gpu_gen=3/Gen4, max=2/Gen3, cur=2/Gen3),
+		 * preserving low bits (0x104) and SPEED_CHANGES/upper bits (0x01000000). */
+		u32 stale = 0x01322104u;
+		assert(gu_pcie_gen_rewrite(stale, 4, 4) == 0x01333104u);
+
+		/* Genuine idle Gen1 (cur=0 < max=2): lift max to Gen4, keep cur at Gen1. */
+		u32 idle_gen1 = 0x00302104u;
+		assert(gu_pcie_gen_rewrite(idle_gen1, 4, 4) == 0x00303104u);
+
+		/* Hardware only trained to Gen3 (e.g. ga100_pcie_gen=3 or Gen3 slot): untouched. */
+		assert(gu_pcie_gen_rewrite(stale, 3, 3) == stale);
+
+		/* Inactive / suspended (hw_max=0, hw_cur=0): untouched. */
+		assert(gu_pcie_gen_rewrite(stale, 0, 0) == stale);
+
+		/* Native Gen4/Gen5 card (max already >= Gen4): untouched. */
+		assert(gu_pcie_gen_rewrite(0x00333104u, 4, 4) == 0x00333104u);
+		assert(gu_pcie_gen_rewrite(0x00444105u, 4, 4) == 0x00444105u);
+
+		/* Unfused Gen1/Gen2 card (gpu_gen < Gen4): untouched. */
+		assert(gu_pcie_gen_rewrite(0x00111102u, 4, 4) == 0x00111102u);
+	}
+
+	puts("GA100 VFI extensions: dynamic 64/80/96/48 GiB FBP sizing, Gen3/Gen4 E1 PHY, branding, and PCIe Gen4 reporting passed");
 	return 0;
 }
