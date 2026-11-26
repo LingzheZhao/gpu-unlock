@@ -259,6 +259,23 @@ int main(void)
 		assert(gu_pcie_gen_rewrite(0x00111102u, 4, 4) == 0x00111102u);
 	}
 
-	puts("GA100 VFI extensions: dynamic 64/80/96/48 GiB FBP sizing, Gen3/Gen4 E1 PHY, branding, and PCIe Gen4 reporting passed");
+	/* GDDR published FB size acceptance (e.g. 48 GiB RTX 4090 with 12 MiB top carveout). */
+	{
+		struct gu_memory_info info = { 0 };
+		u64 usable = 0;
+
+		assert(gu_memory_decode_range(0x0000030au, &info) == 0);
+		assert(info.physical_bytes == (48ull << 30));
+		assert(gu_memory_accept_gddr_published(info.usable_bytes, 49152ull << 20, &usable) == 0);
+		assert(usable == (49152ull << 20));
+		assert(gu_memory_accept_gddr_published(info.usable_bytes, 49140ull << 20, &usable) == 0);
+		assert(usable == (49140ull << 20));
+		/* Reject published > range, ECC-sized mismatch (15/16), and tiny values. */
+		assert(gu_memory_accept_gddr_published(info.usable_bytes, 49153ull << 20, &usable) == -ERANGE);
+		assert(gu_memory_accept_gddr_published(info.usable_bytes, 46080ull << 20, &usable) == -ERANGE);
+		assert(gu_memory_accept_gddr_published(info.usable_bytes, 128ull << 20, &usable) == -ERANGE);
+	}
+
+	puts("GA100 VFI extensions: dynamic 64/80/96/48 GiB FBP sizing, Gen3/Gen4 E1 PHY, branding, PCIe Gen4 reporting, and GDDR carveout passed");
 	return 0;
 }

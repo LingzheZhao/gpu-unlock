@@ -26,6 +26,9 @@ u32 gu_memory_cmp170hx_range(u16 device, u16 subsystem_device,
 			     u32 fbp_count, u32 fbp_disabled,
 			     unsigned int *active_fbps, unsigned int *gib);
 
+int gu_memory_accept_gddr_published(u64 range_usable, u64 published_bytes,
+				    u64 *out_usable);
+
 /* Firmware must be quiesced. Does not alter the temporary Booter layout.
  * Verify final capacity and reconcile firmware bookkeeping before PLM locks. */
 int gu_memory_finalize(struct device *dev, void __iomem *bar, resource_size_t len,

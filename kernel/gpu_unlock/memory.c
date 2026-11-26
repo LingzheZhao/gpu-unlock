@@ -67,6 +67,22 @@ u32 gu_memory_cmp170hx_range(u16 device, u16 subsystem_device,
 	return range;
 }
 
+/* Accept non-ECC GDDR boards whose VBIOS/GFW trims a small top carveout
+ * (e.g. 48 GiB modded RTX 4090 publishing 49140 MiB vs 49152 MiB range)
+ * while still rejecting ECC-sized reductions (>= 1/16, >= 512 MiB on 8 GiB+). */
+int gu_memory_accept_gddr_published(u64 range_usable, u64 published_bytes,
+				    u64 *out_usable)
+{
+	if (!out_usable || published_bytes < (256ull << 20))
+		return -ERANGE;
+	if (published_bytes > range_usable)
+		return -ERANGE;
+	if (range_usable - published_bytes > (64ull << 20))
+		return -ERANGE;
+	*out_usable = published_bytes;
+	return 0;
+}
+
 static int memory_read(void __iomem *bar, resource_size_t len, u32 offset, u32 *value)
 {
 	if (!bar || (u64)offset + 4 > len)
@@ -270,11 +286,22 @@ int gu_memory_finalize(struct device *dev, void __iomem *bar, resource_size_t le
 		if (ret)
 			return ret;
 	} else if (family->memory == GU_MEMORY_GDDR) {
+		u64 range_usable = result.usable_bytes;
+		u64 published_bytes;
+
 		ret = memory_read(bar, len, GU_GFW_FB_SIZE_OFFSET, &published);
 		if (ret)
 			return ret;
-		if (((u64)published << 20) != result.usable_bytes)
-			return -ERANGE;
+		published_bytes = (u64)published << 20;
+		ret = gu_memory_accept_gddr_published(range_usable,
+						      published_bytes,
+						      &result.usable_bytes);
+		if (ret)
+			return ret;
+		if (published_bytes != range_usable)
+			dev_info(dev, "gpu_unlock: accepting GDDR top carveout range=%#llx published=%#llx\n",
+				 (unsigned long long)range_usable,
+				 (unsigned long long)published_bytes);
 	}
 	if (result.usable_bytes < 256ull << 20)
 		return -ERANGE;
