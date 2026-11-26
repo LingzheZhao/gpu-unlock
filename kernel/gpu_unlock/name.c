@@ -31,6 +31,8 @@ static const char gu_cmp170hx_short[] = GU_CMP170HX_SHORT_NAME;
 #define GU_BUS_CURR_SHIFT		16
 #define GU_BUS_GPU_GEN_SHIFT		20
 #define GU_BUS_GEN_MASK			0xfu
+#define GU_RUSD_POLL_PCI		(1ULL << 5) /* NV00DE_RUSD_POLL_PCI */
+#define GU_NV_ERR_NOT_SUPPORTED		0x56u
 
 static bool buf_equals(const char *buf, size_t len, const char *lit, size_t lit_len)
 {
@@ -118,6 +120,11 @@ struct pcie_info_ctx {
 	struct gu_nv_bus_info *info;
 };
 
+struct rusd_poll_ctx {
+	u64 *mask;
+	u64 orig_mask;
+};
+
 struct tracked_card {
 	struct pci_dev *pdev;
 	u8 hw_max;
@@ -132,6 +139,7 @@ static bool full_attached;
 static bool short_attached;
 static bool proc_attached;
 static bool pcie_attached;
+static bool rusd_attached;
 
 static struct tracked_card tracked[GU_MAX_TRACKED_CARDS];
 static unsigned int tracked_count;
@@ -141,6 +149,7 @@ static struct kretprobe full_rp;
 static struct kretprobe short_rp;
 static struct kretprobe proc_rp;
 static struct kretprobe pcie_rp;
+static struct kretprobe rusd_rp;
 
 static void recompute_pcie_report(void)
 {
@@ -292,6 +301,38 @@ static int pcie_info_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
+/* On R550+ GSP drivers, NVML polls PCIe link generation via RM User Shared
+ * Data (RUSD, NV00DE_RUSD_POLL_PCI), where GSP DMAs its cached boot Gen3
+ * directly into host RAM bypassing kbusSendBusInfo_IMPL. Strip POLL_PCI from
+ * RUSD poll requests (returning NV_ERR_NOT_SUPPORTED for PCI-only polls) so
+ * NVML falls back to NV2080_CTRL_CMD_BUS_GET_INFO -> kbusSendBusInfo_IMPL,
+ * while all other RUSD telemetry (power, clocks, temps, util) stays intact. */
+static int rusd_poll_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct rusd_poll_ctx *ctx = (struct rusd_poll_ctx *)ri->data;
+	u64 *mask;
+
+	if (!READ_ONCE(pcie_report_gen))
+		return 1;
+	mask = (u64 *)regs_get_kernel_argument(regs, 1);
+	if (!mask || !(*mask & GU_RUSD_POLL_PCI))
+		return 1;
+	ctx->mask = mask;
+	ctx->orig_mask = *mask;
+	*mask &= ~GU_RUSD_POLL_PCI;
+	return 0;
+}
+
+static int rusd_poll_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct rusd_poll_ctx *ctx = (struct rusd_poll_ctx *)ri->data;
+
+	*ctx->mask = ctx->orig_mask;
+	if (ctx->orig_mask == GU_RUSD_POLL_PCI && regs_return_value(regs) == 0)
+		regs_set_return_value(regs, GU_NV_ERR_NOT_SUPPORTED);
+	return 0;
+}
+
 static bool register_one(struct kretprobe *rp, const char *symbol,
 			 kretprobe_handler_t entry, kretprobe_handler_t ret_fn,
 			 size_t data_size)
@@ -341,15 +382,27 @@ static void attach_probes(void)
 					     sizeof(struct pcie_info_ctx));
 		added |= pcie_attached;
 	}
+	if (want_pcie_gen && pcie_attached && !rusd_attached) {
+		rusd_attached = register_one(&rusd_rp,
+					     "gpushareddataCtrlCmdRequestDataPoll_IMPL",
+					     rusd_poll_entry, rusd_poll_ret,
+					     sizeof(struct rusd_poll_ctx));
+		added |= rusd_attached;
+	}
 	if (added)
-		pr_info("gpu_unlock: CMP 170HX runtime hooks active (name=%d/%d/%d pcie_gen=%d)\n",
-			full_attached, short_attached, proc_attached, pcie_attached);
+		pr_info("gpu_unlock: CMP 170HX runtime hooks active (name=%d/%d/%d pcie_gen=%d/%d)\n",
+			full_attached, short_attached, proc_attached,
+			pcie_attached, rusd_attached);
 	mutex_unlock(&name_lock);
 }
 
 static void detach_probes(void)
 {
 	mutex_lock(&name_lock);
+	if (rusd_attached) {
+		unregister_kretprobe(&rusd_rp);
+		rusd_attached = false;
+	}
 	if (pcie_attached) {
 		unregister_kretprobe(&pcie_rp);
 		pcie_attached = false;
