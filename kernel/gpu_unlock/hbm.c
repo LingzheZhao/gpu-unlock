@@ -132,6 +132,7 @@ static int capture_profile(struct gu_hbm *hbm, void __iomem *bar)
 		return problem(hbm, -EAGAIN, "HBM PLL access closed", first + PLL_PLM, i);
 	hbm->fbpas = mask;
 	hbm->first_fbpa = first;
+	hbm->stock_coeff = coeff;
 	hbm->busy_coeff = coeff;
 	hbm->idle_coeff = idle_coeff(hbm);
 	hbm->profile = true;
@@ -202,16 +203,16 @@ static int pll_wait(struct gu_hbm *hbm, void __iomem *bar, u32 coeff,
 	return 0;
 }
 
-static int set_clock(struct gu_hbm *hbm, void __iomem *bar, bool idle)
+static int set_clock(struct gu_hbm *hbm, void __iomem *bar, u32 prev_coeff, u32 value)
 {
 	u32 old = readl(bar + hbm->first_fbpa + PLL_COEFF);
 	u32 cfg = readl(bar + hbm->first_fbpa + PLL_CFG);
-	u32 value = idle ? hbm->idle_coeff : hbm->busy_coeff;
 	bool bypass = (old ^ value) & PLDIV_MASK;
 	unsigned int i;
 	int ret;
 
-	if (old != hbm->busy_coeff && old != hbm->idle_coeff)
+	if (old != prev_coeff && old != value &&
+	    old != hbm->busy_coeff && old != hbm->idle_coeff)
 		return problem(hbm, -EIO, "HBM PLL configuration changed", hbm->first_fbpa + PLL_COEFF, old);
 	if (!readable(cfg) || (cfg & (PLL_LOCK | 1 | PLL_BYPASS | (1u << 7))) != (PLL_LOCK | 1))
 		return problem(hbm, -EIO, "HBM PLL not ready for transition", hbm->first_fbpa + PLL_CFG, cfg);
@@ -327,6 +328,8 @@ struct gu_hbm_switch {
 	struct gu_hbm *hbm;
 	void __iomem *bar;
 	bool idle;
+	u32 prev_coeff;
+	u32 next_coeff;
 };
 
 static int switch_profile(void *data)
@@ -340,7 +343,7 @@ static int switch_profile(void *data)
 	if (!ret)
 		ret = refresh(hbm, bar, idle, true);
 	if (!ret)
-		ret = set_clock(hbm, bar, idle);
+		ret = set_clock(hbm, bar, work->prev_coeff, work->next_coeff);
 	if (!ret)
 		ret = refresh(hbm, bar, idle, false);
 	if (!hbm->fb_stopped)
@@ -351,7 +354,8 @@ static int switch_profile(void *data)
 
 		/* Keep traffic stopped if rollback could not restore a known,
 		 * locked profile. A later restore can reuse our held request. */
-		if (coeff != hbm->busy_coeff && coeff != hbm->idle_coeff)
+		if (coeff != work->prev_coeff && coeff != work->next_coeff &&
+		    coeff != hbm->busy_coeff && coeff != hbm->idle_coeff)
 			return problem(hbm, -EIO, "HBM FB resume blocked by unknown PLL", hbm->first_fbpa + PLL_COEFF, coeff);
 		ready = pll_wait(hbm, bar, coeff, false, "HBM FB resume blocked by PLL timeout");
 		if (ready)
@@ -364,11 +368,61 @@ static int switch_profile(void *data)
 /* A client that reaches the card from another CPU while the framebuffer is
  * stopped can be left hung or faulted, and stalls the reads here for tens of
  * milliseconds. Hold the other CPUs for the two milliseconds a switch takes. */
-static int transition(struct gu_hbm *hbm, void __iomem *bar, bool idle)
+static int transition_coeff(struct gu_hbm *hbm, void __iomem *bar, bool idle,
+			    u32 prev_coeff, u32 next_coeff)
 {
-	struct gu_hbm_switch work = { .hbm = hbm, .bar = bar, .idle = idle };
+	struct gu_hbm_switch work = {
+		.hbm = hbm, .bar = bar, .idle = idle,
+		.prev_coeff = prev_coeff, .next_coeff = next_coeff,
+	};
 
 	return stop_machine(switch_profile, &work, NULL);
+}
+
+static int transition(struct gu_hbm *hbm, void __iomem *bar, bool idle)
+{
+	u32 prev = idle ? hbm->busy_coeff : hbm->idle_coeff;
+	u32 next = idle ? hbm->idle_coeff : hbm->busy_coeff;
+
+	return transition_coeff(hbm, bar, idle, prev, next);
+}
+
+int gu_hbm_set_busy_ndiv(struct gu_hbm *hbm, void __iomem *bar, u32 ndiv, u64 now)
+{
+	u32 old_busy, prev_coeff, new_coeff;
+	int ret;
+
+	hbm->reason = NULL;
+	if (ndiv && (ndiv < GU_HBM_BUSY_NDIV_MIN || ndiv > GU_HBM_BUSY_NDIV_MAX))
+		return problem(hbm, -EINVAL, "HBM busy NDIV out of range", 0, ndiv);
+	if (!gu_hbm_booted(bar))
+		return problem(hbm, -EAGAIN, "waiting for GFW/GSP boot", GU_GFW_BOOT_OFFSET, 0);
+	if (!hbm->profile) {
+		ret = capture_profile(hbm, bar);
+		if (ret)
+			return ret;
+	}
+	new_coeff = ndiv ? ((hbm->stock_coeff & ~NDIV_MASK) | (ndiv << 8)) : hbm->stock_coeff;
+	if (((new_coeff & NDIV_MASK) >> 8) * hbm->policy.pldiv <
+	    hbm->policy.ndiv * ((new_coeff & PLDIV_MASK) >> 16))
+		return problem(hbm, -EINVAL, "HBM busy target below idle clock", 0, ndiv);
+	if (new_coeff == hbm->busy_coeff && !hbm->idle && !hbm->fb_stopped) {
+		hbm->target_busy_ndiv = ndiv;
+		hbm->quiet_since = now;
+		return 0;
+	}
+	old_busy = hbm->busy_coeff;
+	prev_coeff = hbm->idle ? hbm->idle_coeff : old_busy;
+	ret = transition_coeff(hbm, bar, false, prev_coeff, new_coeff);
+	if (ret) {
+		hbm->busy_coeff = old_busy;
+		return ret;
+	}
+	hbm->busy_coeff = new_coeff;
+	hbm->target_busy_ndiv = ndiv;
+	hbm->idle = false;
+	hbm->quiet_since = now;
+	return 0;
 }
 
 int gu_hbm_restore(struct gu_hbm *hbm, void __iomem *bar)
@@ -479,6 +533,12 @@ int gu_hbm_poll(struct gu_hbm *hbm, void __iomem *bar, u64 now)
 		ret = capture_profile(hbm, bar);
 		if (ret)
 			return ret;
+		if (hbm->target_busy_ndiv &&
+		    ((hbm->busy_coeff & NDIV_MASK) >> 8) != hbm->target_busy_ndiv) {
+			ret = gu_hbm_set_busy_ndiv(hbm, bar, hbm->target_busy_ndiv, now);
+			if (ret)
+				return ret;
+		}
 	}
 	if (hbm->policy.mode == GU_HBM_BUSY)
 		return gu_hbm_restore(hbm, bar);

@@ -13,6 +13,8 @@
 #define GU_HBM_IDLE_NDIV 20u
 #define GU_HBM_IDLE_PLDIV 1u
 #define GU_HBM_IDLE_REFRESH 48u
+#define GU_HBM_BUSY_NDIV_MIN 30u
+#define GU_HBM_BUSY_NDIV_MAX 80u
 
 enum gu_hbm_mode {
 	GU_HBM_AUTO,
@@ -33,7 +35,8 @@ struct gu_hbm {
 	struct gu_hbm_policy policy;
 	struct gu_hbm_counter counter[16];
 	u16 counters, active_counters;
-	u32 fbpas, first_fbpa, busy_coeff, idle_coeff, busy_refresh[24];
+	u32 fbpas, first_fbpa, stock_coeff, busy_coeff, idle_coeff, busy_refresh[24];
+	u32 target_busy_ndiv;
 	u64 sampled, quiet_since;
 	bool profile, baseline, idle, fb_stopped;
 	/* Last failed hardware check, for the worker's rate-limited log. */
@@ -41,11 +44,12 @@ struct gu_hbm {
 	u32 reg, value, coverage[3];
 };
 
-/* Called with PCI access held. Only poll and restore write registers. */
+/* Called with PCI access held. Only poll, restore, and set_busy_ndiv write registers. */
 bool gu_hbm_booted(void __iomem *bar);
 void gu_hbm_init(struct gu_hbm *hbm);
 int gu_hbm_poll(struct gu_hbm *hbm, void __iomem *bar, u64 now);
 int gu_hbm_restore(struct gu_hbm *hbm, void __iomem *bar);
+int gu_hbm_set_busy_ndiv(struct gu_hbm *hbm, void __iomem *bar, u32 ndiv, u64 now);
 void gu_hbm_reset(struct gu_hbm *hbm);
 
 struct pci_dev;

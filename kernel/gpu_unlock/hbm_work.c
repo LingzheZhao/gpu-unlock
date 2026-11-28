@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <linux/bitops.h>
+#include <linux/device.h>
 #include <linux/err.h>
 #include <linux/limits.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/suspend.h>
+#include <linux/sysfs.h>
 #include <linux/timekeeping.h>
 #include <linux/version.h>
 #include <linux/workqueue.h>
@@ -14,12 +19,15 @@
 #include "registers.h"
 
 struct gu_hbm_worker {
+	struct list_head node;
+	struct mutex ctl_lock;
 	struct pci_dev *pdev;
 	void __iomem *bar;
 	struct gu_hbm hbm;
 	struct delayed_work work;
 	struct notifier_block pci_nb, pm_nb;
-	bool bound, paused, disabled, stopping, pci_registered, pm_registered;
+	bool bound, paused, busy_ctl, disabled, stopping;
+	bool pci_registered, pm_registered, sysfs_ndiv, sysfs_status;
 	bool boot_seen;
 	const char *last_reason;
 	int last_error;
@@ -27,6 +35,25 @@ struct gu_hbm_worker {
 	int hard_fails;
 	u64 last_report, last_status;
 };
+
+static LIST_HEAD(gu_hbm_workers);
+static DEFINE_MUTEX(gu_hbm_workers_lock);
+
+static struct gu_hbm_worker *find_worker(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct gu_hbm_worker *worker, *found = NULL;
+
+	mutex_lock(&gu_hbm_workers_lock);
+	list_for_each_entry(worker, &gu_hbm_workers, node) {
+		if (worker->pdev == pdev) {
+			found = worker;
+			break;
+		}
+	}
+	mutex_unlock(&gu_hbm_workers_lock);
+	return found;
+}
 
 static bool nvidia(struct pci_dev *pdev)
 {
@@ -36,7 +63,8 @@ static bool nvidia(struct pci_dev *pdev)
 static void queue(struct gu_hbm_worker *worker, unsigned long delay)
 {
 	if (READ_ONCE(worker->bound) && !READ_ONCE(worker->paused) &&
-	    !READ_ONCE(worker->disabled) && !READ_ONCE(worker->stopping))
+	    !READ_ONCE(worker->busy_ctl) && !READ_ONCE(worker->disabled) &&
+	    !READ_ONCE(worker->stopping))
 		mod_delayed_work(system_freezable_wq, &worker->work, delay);
 }
 
@@ -182,8 +210,9 @@ static void poll(struct work_struct *work)
 	unsigned int delay = GU_HBM_POLL_MS;
 	int pm;
 
-	if (READ_ONCE(worker->paused) || READ_ONCE(worker->disabled) ||
-	    READ_ONCE(worker->stopping) || !READ_ONCE(worker->bound))
+	if (READ_ONCE(worker->paused) || READ_ONCE(worker->busy_ctl) ||
+	    READ_ONCE(worker->disabled) || READ_ONCE(worker->stopping) ||
+	    !READ_ONCE(worker->bound))
 		return;
 	if (device_trylock(&worker->pdev->dev)) {
 		pm = begin(worker);
@@ -278,6 +307,130 @@ static int pm_notify(struct notifier_block *nb, unsigned long event, void *unuse
 	return NOTIFY_DONE;
 }
 
+static u32 coeff_mhz(u32 coeff)
+{
+	u32 mdiv = coeff & 0xffu;
+	u32 ndiv = (coeff >> 8) & 0xffu;
+	u32 pldiv = (coeff >> 16) & 0x3fu;
+
+	if (!mdiv || !pldiv)
+		return 0;
+	return 27u * ndiv / mdiv / pldiv;
+}
+
+static ssize_t gpu_unlock_hbm_ndiv_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	struct gu_hbm_worker *worker = find_worker(dev);
+	u32 ndiv;
+
+	if (!worker)
+		return -ENODEV;
+	mutex_lock(&worker->ctl_lock);
+	if (worker->hbm.profile)
+		ndiv = (worker->hbm.busy_coeff >> 8) & 0xffu;
+	else
+		ndiv = worker->hbm.target_busy_ndiv;
+	mutex_unlock(&worker->ctl_lock);
+	return sysfs_emit(buf, "%u\n", ndiv);
+}
+
+static ssize_t gpu_unlock_hbm_ndiv_store(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf, size_t count)
+{
+	struct gu_hbm_worker *worker = find_worker(dev);
+	unsigned int val;
+	int pm, ret;
+
+	if (!worker)
+		return -ENODEV;
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+	if (val && (val < GU_HBM_BUSY_NDIV_MIN || val > GU_HBM_BUSY_NDIV_MAX))
+		return -EINVAL;
+
+	mutex_lock(&worker->ctl_lock);
+	if (READ_ONCE(worker->stopping) || READ_ONCE(worker->paused)) {
+		mutex_unlock(&worker->ctl_lock);
+		return -EBUSY;
+	}
+	WRITE_ONCE(worker->busy_ctl, true);
+	cancel_delayed_work_sync(&worker->work);
+
+	pci_dev_lock(worker->pdev);
+	pm = begin(worker);
+	if (pm < 0) {
+		ret = pm;
+	} else {
+		ret = gu_hbm_set_busy_ndiv(&worker->hbm, worker->bar, val, ktime_get_ns());
+		if (!ret) {
+			u32 coeff = worker->hbm.busy_coeff;
+
+			worker->hard_fails = 0;
+			worker->last_error = 0;
+			worker->last_reason = NULL;
+			WRITE_ONCE(worker->disabled, false);
+			pci_info(worker->pdev, "gpu_unlock: HBM busy NDIV set to %u (%u MHz) coeff=%#x fbpas=%u/24\n",
+				 (coeff >> 8) & 0xffu, coeff_mhz(coeff), coeff,
+				 hweight32(worker->hbm.fbpas));
+		} else {
+			pci_warn(worker->pdev, "gpu_unlock: HBM busy NDIV %u failed (%d) %s reg=%#x value=%#x\n",
+				 val, ret,
+				 worker->hbm.reason ? worker->hbm.reason : "hardware unavailable",
+				 worker->hbm.reg, worker->hbm.value);
+		}
+		end(worker, pm);
+	}
+	pci_dev_unlock(worker->pdev);
+
+	WRITE_ONCE(worker->busy_ctl, false);
+	queue(worker, msecs_to_jiffies(GU_HBM_POLL_MS));
+	mutex_unlock(&worker->ctl_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(gpu_unlock_hbm_ndiv);
+
+static ssize_t gpu_unlock_hbm_status_show(struct device *dev,
+					  struct device_attribute *attr, char *buf)
+{
+	struct gu_hbm_worker *worker = find_worker(dev);
+	struct gu_hbm *hbm;
+	enum gu_hbm_mode mode;
+	u32 busy_ndiv = 0, busy_mhz = 0, stock_ndiv = 0, cur_ndiv = 0, cur_mhz = 0;
+	u32 idle_ndiv = 0, fbpas = 0, first_idx = 0;
+	const char *state = "uninitialized";
+	bool disabled;
+
+	if (!worker)
+		return -ENODEV;
+	mutex_lock(&worker->ctl_lock);
+	hbm = &worker->hbm;
+	mode = hbm->policy.mode;
+	idle_ndiv = hbm->policy.ndiv;
+	disabled = READ_ONCE(worker->disabled);
+	if (hbm->profile) {
+		u32 cur = hbm->idle ? hbm->idle_coeff : hbm->busy_coeff;
+
+		busy_ndiv = (hbm->busy_coeff >> 8) & 0xffu;
+		busy_mhz = coeff_mhz(hbm->busy_coeff);
+		stock_ndiv = (hbm->stock_coeff >> 8) & 0xffu;
+		cur_ndiv = (cur >> 8) & 0xffu;
+		cur_mhz = coeff_mhz(cur);
+		fbpas = hweight32(hbm->fbpas);
+		first_idx = (hbm->first_fbpa - 0x00900000u) / 0x4000u;
+		state = hbm->idle ? "idle" : "busy";
+	}
+	mutex_unlock(&worker->ctl_lock);
+	return sysfs_emit(buf,
+			  "mode=%s state=%s busy_ndiv=%u busy_mhz=%u current_ndiv=%u current_mhz=%u stock_ndiv=%u idle_ndiv=%u fbpas=%u/24 first_fbpa=%u disabled=%u\n",
+			  mode_name(mode), state, busy_ndiv, busy_mhz,
+			  cur_ndiv, cur_mhz, stock_ndiv, idle_ndiv,
+			  fbpas, first_idx, disabled ? 1u : 0u);
+}
+static DEVICE_ATTR_RO(gpu_unlock_hbm_status);
+
 struct gu_hbm_worker *gu_hbm_start(struct pci_dev *pdev)
 {
 	struct gu_hbm_worker *worker;
@@ -286,6 +439,8 @@ struct gu_hbm_worker *gu_hbm_start(struct pci_dev *pdev)
 	worker = kzalloc(sizeof(*worker), GFP_KERNEL);
 	if (!worker)
 		return ERR_PTR(-ENOMEM);
+	INIT_LIST_HEAD(&worker->node);
+	mutex_init(&worker->ctl_lock);
 	gu_hbm_init(&worker->hbm);
 	worker->pdev = pdev;
 	INIT_DELAYED_WORK(&worker->work, poll);
@@ -299,6 +454,17 @@ struct gu_hbm_worker *gu_hbm_start(struct pci_dev *pdev)
 		ret = -ENODEV;
 		goto fail;
 	}
+	mutex_lock(&gu_hbm_workers_lock);
+	list_add_tail(&worker->node, &gu_hbm_workers);
+	mutex_unlock(&gu_hbm_workers_lock);
+	ret = device_create_file(&pdev->dev, &dev_attr_gpu_unlock_hbm_ndiv);
+	if (ret)
+		goto fail;
+	worker->sysfs_ndiv = true;
+	ret = device_create_file(&pdev->dev, &dev_attr_gpu_unlock_hbm_status);
+	if (ret)
+		goto fail;
+	worker->sysfs_status = true;
 	ret = bus_register_notifier(&pci_bus_type, &worker->pci_nb);
 	if (ret)
 		goto fail;
@@ -326,6 +492,14 @@ void gu_hbm_remove(struct gu_hbm_worker *worker)
 	if (!worker)
 		return;
 	WRITE_ONCE(worker->stopping, true);
+	if (worker->sysfs_status)
+		device_remove_file(&worker->pdev->dev, &dev_attr_gpu_unlock_hbm_status);
+	if (worker->sysfs_ndiv)
+		device_remove_file(&worker->pdev->dev, &dev_attr_gpu_unlock_hbm_ndiv);
+	mutex_lock(&gu_hbm_workers_lock);
+	if (!list_empty(&worker->node))
+		list_del_init(&worker->node);
+	mutex_unlock(&gu_hbm_workers_lock);
 	if (worker->pm_registered)
 		unregister_pm_notifier(&worker->pm_nb);
 	if (worker->pci_registered)
